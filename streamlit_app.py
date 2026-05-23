@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import hmac
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -87,6 +88,39 @@ def get_api_key(provider: str) -> str:
     return ""
 
 
+def check_password() -> bool:
+    app_password = get_secret("APP_PASSWORD")
+
+    if not app_password:
+        st.error(
+            "APP_PASSWORD nėra nustatytas Streamlit Secrets. "
+            "Programa saugumo sumetimais nerodoma."
+        )
+        return False
+
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.markdown("## 🔐 ChatMD prisijungimas")
+    st.caption("Įveskite slaptažodį, kad galėtumėte naudotis ChatMD.")
+
+    entered_password = st.text_input(
+        "Slaptažodis",
+        type="password",
+        placeholder="Įveskite slaptažodį",
+        label_visibility="collapsed",
+    )
+
+    if st.button("Prisijungti", use_container_width=True):
+        if hmac.compare_digest(entered_password, app_password):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Neteisingas slaptažodis.")
+
+    return False
+
+
 def init_state() -> None:
     st.session_state.setdefault("provider", DEFAULT_PROVIDER)
     st.session_state.setdefault("models_cache", {})
@@ -100,6 +134,7 @@ def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("chat_counter", 1)
     st.session_state.setdefault("history", [])
+    st.session_state.setdefault("authenticated", False)
 
 
 def reset_chat() -> None:
@@ -409,6 +444,10 @@ def render_brand() -> None:
 def render_sidebar() -> None:
     render_brand()
 
+    if st.sidebar.button("Atsijungti", use_container_width=True):
+        st.session_state.authenticated = False
+        st.rerun()
+
     if st.sidebar.button("＋ Naujas pokalbis", use_container_width=True):
         reset_chat()
         st.rerun()
@@ -513,6 +552,10 @@ def main() -> None:
     )
     init_state()
     render_css()
+
+    if not check_password():
+        st.stop()
+
     render_sidebar()
 
     st.title("ChatMD")
