@@ -4,7 +4,7 @@ import base64
 import datetime as dt
 import hmac
 import html
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import streamlit as st
 
@@ -42,7 +42,7 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_23_5"
+APP_VERSION = "V. 2026_05_24_1"
 DEFAULT_PROVIDER = "Google Gemini"
 
 FALLBACK_MODELS: Dict[str, List[str]] = {
@@ -59,6 +59,18 @@ FALLBACK_MODELS: Dict[str, List[str]] = {
         "gpt-4.1-mini",
     ],
 }
+
+
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
 
 DEFAULT_AGENTS = {
     "Bendras asistentas": {
@@ -205,6 +217,75 @@ def render_css() -> None:
             border-bottom-right-radius: 6px;
         }
 
+        .thinking-wrap {
+            display: flex;
+            justify-content: flex-start;
+            width: 100%;
+            margin: 0.45rem 0;
+        }
+
+        .thinking-card {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.65rem;
+            padding: 0.62rem 0.78rem;
+            border-radius: 16px;
+            background: #ffffff;
+            border: 1px solid #d8e2f0;
+            box-shadow: 0 5px 18px rgba(15, 23, 42, 0.05);
+            color: #334155;
+            font-size: 0.92rem;
+        }
+
+        .thinking-spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid #cbd5e1;
+            border-top-color: #2563eb;
+            border-radius: 50%;
+            animation: chatmd-spin 0.8s linear infinite;
+        }
+
+        .thinking-text {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.15rem;
+        }
+
+        .thinking-dots span {
+            animation: chatmd-blink 1.2s infinite;
+            opacity: 0.25;
+        }
+
+        .thinking-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .thinking-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        .thinking-time {
+            color: #64748b;
+            font-size: 0.78rem;
+            margin-top: 0.05rem;
+        }
+
+        @keyframes chatmd-spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        @keyframes chatmd-blink {
+            0%, 80%, 100% {
+                opacity: 0.25;
+            }
+            40% {
+                opacity: 1;
+            }
+        }
+
         [data-testid="stChatInput"] {
             max-width: 980px;
             margin: 0 auto;
@@ -321,7 +402,6 @@ def init_state() -> None:
     st.session_state.setdefault("model", FALLBACK_MODELS[DEFAULT_PROVIDER][0])
     st.session_state.setdefault("web_search_enabled", True)
     st.session_state.setdefault("temperature", 0.7)
-    st.session_state.setdefault("max_output_tokens", 3000)
     st.session_state.setdefault("mode", "chat")
     st.session_state.setdefault("agent_name", "Bendras asistentas")
     st.session_state.setdefault("agents", DEFAULT_AGENTS.copy())
@@ -414,15 +494,133 @@ class PathLike:
         return "." + self.name.rsplit(".", 1)[1].lower()
 
 
+def is_image_file(uploaded_file) -> bool:
+    return PathLike(uploaded_file.name).suffix in IMAGE_SUFFIXES
+
+
+def get_image_mime_type(uploaded_file) -> str:
+    suffix = PathLike(uploaded_file.name).suffix
+    return IMAGE_MIME_TYPES.get(suffix, "application/octet-stream")
+
+
+def make_image_note(uploaded_files) -> str:
+    if not uploaded_files:
+        return ""
+
+    image_names = [f.name for f in uploaded_files if is_image_file(f)]
+
+    if not image_names:
+        return ""
+
+    return "Prisegti vaizdai, perduoti modeliui kaip tikri multimodal vaizdo duomenys:\n" + "\n".join(
+        f"- {name}" for name in image_names
+    )
+
+
+def make_google_contents(messages: List[Dict[str, str]], files_context: str, uploaded_files) -> List[Any]:
+    text_parts = [f"Sisteminė instrukcija:\n{build_system_prompt()}"]
+
+    for m in messages[-20:]:
+        role = "Vartotojas" if m["role"] == "user" else "Asistentas"
+        text_parts.append(f"{role}: {m['content']}")
+
+    if files_context:
+        text_parts.append("Prisegtų failų tekstinis turinys:\n" + files_context)
+
+    image_note = make_image_note(uploaded_files)
+
+    if image_note:
+        text_parts.append(image_note)
+
+    contents: List[Any] = ["\n\n".join(text_parts)]
+
+    if genai_types is not None and uploaded_files:
+        for uploaded_file in uploaded_files:
+            if not is_image_file(uploaded_file):
+                continue
+
+            image_bytes = uploaded_file.getvalue()
+
+            if len(image_bytes) > MAX_INLINE_IMAGE_BYTES:
+                contents.append(
+                    f"[Vaizdas {uploaded_file.name} per didelis inline siuntimui: "
+                    f"{len(image_bytes) / (1024 * 1024):.1f} MB. Didžiausia riba: 20 MB.]"
+                )
+                continue
+
+            contents.append(
+                genai_types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=get_image_mime_type(uploaded_file),
+                )
+            )
+
+    return contents
+
+
+def make_openai_input_messages(
+    messages: List[Dict[str, str]],
+    files_context: str,
+    uploaded_files,
+) -> List[Dict[str, Any]]:
+    input_messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": build_system_prompt()}
+    ]
+    input_messages.extend(messages[-20:])
+
+    content_parts: List[Dict[str, str]] = []
+
+    if files_context:
+        content_parts.append(
+            {
+                "type": "input_text",
+                "text": "Prisegtų failų tekstinis turinys:\n" + files_context,
+            }
+        )
+
+    image_note = make_image_note(uploaded_files)
+
+    if image_note:
+        content_parts.append({"type": "input_text", "text": image_note})
+
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            if not is_image_file(uploaded_file):
+                continue
+
+            image_bytes = uploaded_file.getvalue()
+
+            if len(image_bytes) > MAX_INLINE_IMAGE_BYTES:
+                content_parts.append(
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"[Vaizdas {uploaded_file.name} per didelis inline siuntimui: "
+                            f"{len(image_bytes) / (1024 * 1024):.1f} MB. Didžiausia riba: 20 MB.]"
+                        ),
+                    }
+                )
+                continue
+
+            encoded = base64.b64encode(image_bytes).decode("utf-8")
+            mime_type = get_image_mime_type(uploaded_file)
+            data_url = f"data:{mime_type};base64,{encoded}"
+            content_parts.append({"type": "input_image", "image_url": data_url})
+
+    if content_parts:
+        input_messages.append({"role": "user", "content": content_parts})
+
+    return input_messages
+
+
 def read_uploaded_file(uploaded_file) -> str:
     name = uploaded_file.name
     suffix = PathLike(name).suffix
     data = uploaded_file.getvalue()
 
     try:
-        if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-            encoded = base64.b64encode(data).decode("utf-8")
-            return f"[Vaizdas {name}, base64 pradžia]: {encoded[:3000]}"
+        if suffix in IMAGE_SUFFIXES:
+            return f"[Vaizdas {name}] Vaizdas bus perduotas modeliui kaip multimodal image input, ne kaip tekstinė base64 ištrauka."
 
         if suffix == ".pdf":
             if PdfReader is None:
@@ -517,32 +715,23 @@ def make_files_context(uploaded_files) -> str:
     return "\n\n".join(chunks)
 
 
-def answer_google(model: str, messages: List[Dict[str, str]], files_context: str) -> str:
+def answer_google(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None) -> str:
     api_key = get_api_key("Google Gemini")
 
     if not api_key:
         return "🔴 Google Gemini API raktas neįvestas Streamlit Secrets."
 
     client = genai.Client(api_key=api_key)
-    parts = [f"Sisteminė instrukcija:\n{build_system_prompt()}"]
-
-    for m in messages[-20:]:
-        role = "Vartotojas" if m["role"] == "user" else "Asistentas"
-        parts.append(f"{role}: {m['content']}")
-
-    if files_context:
-        parts.append("Prisegtų failų turinys:\n" + files_context)
+    contents = make_google_contents(messages, files_context, uploaded_files or [])
 
     config = {
         "temperature": st.session_state.temperature,
-        "max_output_tokens": int(st.session_state.max_output_tokens),
     }
 
     if st.session_state.web_search_enabled and genai_types is not None:
         try:
             config = genai_types.GenerateContentConfig(
                 temperature=st.session_state.temperature,
-                max_output_tokens=int(st.session_state.max_output_tokens),
                 tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
             )
         except Exception:
@@ -550,14 +739,14 @@ def answer_google(model: str, messages: List[Dict[str, str]], files_context: str
 
     response = client.models.generate_content(
         model=model,
-        contents="\n\n".join(parts),
+        contents=contents,
         config=config,
     )
 
     return getattr(response, "text", "") or "Gautas tuščias atsakymas."
 
 
-def stream_google(model: str, messages: List[Dict[str, str]], files_context: str):
+def stream_google(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None):
     api_key = get_api_key("Google Gemini")
 
     if not api_key:
@@ -565,25 +754,16 @@ def stream_google(model: str, messages: List[Dict[str, str]], files_context: str
         return
 
     client = genai.Client(api_key=api_key)
-    parts = [f"Sisteminė instrukcija:\n{build_system_prompt()}"]
-
-    for m in messages[-20:]:
-        role = "Vartotojas" if m["role"] == "user" else "Asistentas"
-        parts.append(f"{role}: {m['content']}")
-
-    if files_context:
-        parts.append("Prisegtų failų turinys:\n" + files_context)
+    contents = make_google_contents(messages, files_context, uploaded_files or [])
 
     config = {
         "temperature": st.session_state.temperature,
-        "max_output_tokens": int(st.session_state.max_output_tokens),
     }
 
     if st.session_state.web_search_enabled and genai_types is not None:
         try:
             config = genai_types.GenerateContentConfig(
                 temperature=st.session_state.temperature,
-                max_output_tokens=int(st.session_state.max_output_tokens),
                 tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
             )
         except Exception:
@@ -592,7 +772,7 @@ def stream_google(model: str, messages: List[Dict[str, str]], files_context: str
     try:
         stream = client.models.generate_content_stream(
             model=model,
-            contents="\n\n".join(parts),
+            contents=contents,
             config=config,
         )
 
@@ -601,31 +781,21 @@ def stream_google(model: str, messages: List[Dict[str, str]], files_context: str
             if text:
                 yield text
     except Exception:
-        yield answer_google(model, messages, files_context)
+        yield answer_google(model, messages, files_context, uploaded_files)
 
 
-def answer_openai(model: str, messages: List[Dict[str, str]], files_context: str) -> str:
+def answer_openai(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None) -> str:
     api_key = get_api_key("OpenAI")
 
     if not api_key:
         return "🔴 OpenAI API raktas neįvestas Streamlit Secrets."
 
     client = OpenAI(api_key=api_key)
-    input_messages = [{"role": "system", "content": build_system_prompt()}]
-    input_messages.extend(messages[-20:])
-
-    if files_context:
-        input_messages.append(
-            {
-                "role": "user",
-                "content": "Prisegtų failų turinys:\n" + files_context,
-            }
-        )
+    input_messages = make_openai_input_messages(messages, files_context, uploaded_files or [])
 
     kwargs = {
         "model": model,
         "input": input_messages,
-        "max_output_tokens": int(st.session_state.max_output_tokens),
     }
 
     if not model.startswith(("gpt-5", "o1", "o3", "o4")):
@@ -651,7 +821,7 @@ def answer_openai(model: str, messages: List[Dict[str, str]], files_context: str
     return getattr(response, "output_text", "") or "Gautas tuščias atsakymas."
 
 
-def stream_openai(model: str, messages: List[Dict[str, str]], files_context: str):
+def stream_openai(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None):
     api_key = get_api_key("OpenAI")
 
     if not api_key:
@@ -659,21 +829,11 @@ def stream_openai(model: str, messages: List[Dict[str, str]], files_context: str
         return
 
     client = OpenAI(api_key=api_key)
-    input_messages = [{"role": "system", "content": build_system_prompt()}]
-    input_messages.extend(messages[-20:])
-
-    if files_context:
-        input_messages.append(
-            {
-                "role": "user",
-                "content": "Prisegtų failų turinys:\n" + files_context,
-            }
-        )
+    input_messages = make_openai_input_messages(messages, files_context, uploaded_files or [])
 
     kwargs = {
         "model": model,
         "input": input_messages,
-        "max_output_tokens": int(st.session_state.max_output_tokens),
         "stream": True,
     }
 
@@ -725,7 +885,7 @@ def stream_openai(model: str, messages: List[Dict[str, str]], files_context: str
                 raise
         except Exception:
             kwargs.pop("stream", None)
-            yield answer_openai(model, messages, files_context)
+            yield answer_openai(model, messages, files_context, uploaded_files)
 
 
 def stream_answer(uploaded_files):
@@ -735,11 +895,11 @@ def stream_answer(uploaded_files):
 
     try:
         if provider == "Google Gemini":
-            yield from stream_google(model, st.session_state.messages, files_context)
+            yield from stream_google(model, st.session_state.messages, files_context, uploaded_files)
             return
 
         if provider == "OpenAI":
-            yield from stream_openai(model, st.session_state.messages, files_context)
+            yield from stream_openai(model, st.session_state.messages, files_context, uploaded_files)
             return
 
         yield "Nežinomas teikėjas."
@@ -895,14 +1055,6 @@ def render_sidebar() -> None:
         0.1,
     )
 
-    st.session_state.max_output_tokens = st.sidebar.slider(
-        "Max output tokens",
-        512,
-        8000,
-        int(st.session_state.max_output_tokens),
-        256,
-    )
-
     st.sidebar.divider()
     st.sidebar.subheader("Istorija šioje sesijoje")
 
@@ -960,6 +1112,25 @@ def render_chat_message(role: str, content: str) -> None:
         render_user_message(content)
     else:
         st.markdown(content)
+
+
+def render_thinking(placeholder) -> None:
+    placeholder.markdown(
+        """
+        <div class="thinking-wrap">
+            <div class="thinking-card">
+                <div class="thinking-spinner"></div>
+                <div>
+                    <div class="thinking-text">
+                        Galvoju<span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>
+                    </div>
+                    <div class="thinking-time">Ruošiu atsakymą</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
@@ -1036,6 +1207,8 @@ def main() -> None:
         render_user_message(visible_prompt)
 
         assistant_placeholder = st.empty()
+        render_thinking(assistant_placeholder)
+
         streamed_answer = ""
 
         for chunk in stream_answer(uploaded_files):
