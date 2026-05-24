@@ -4,8 +4,11 @@ import base64
 import datetime as dt
 import hmac
 import html
+import json
+import sqlite3
 import time
-from typing import Any, Dict, List, Tuple
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -43,8 +46,9 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_24_4"
+APP_VERSION = "V. 2026_05_24_8"
 DEFAULT_PROVIDER = "Google Gemini"
+HISTORY_DB_PATH = "chatmd_history.db"
 
 FALLBACK_MODELS: Dict[str, List[str]] = {
     "Google Gemini": [
@@ -106,6 +110,147 @@ def get_api_key(provider: str) -> str:
     return ""
 
 
+def now_iso() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def init_history_db() -> None:
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                messages_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_chat_title(messages: List[Dict[str, str]]) -> str:
+    for message in messages:
+        if message.get("role") == "user":
+            title = str(message.get("content", "")).strip().replace("\n", " ")
+            return title[:60] if title else "Pokalbis"
+    return "Pokalbis"
+
+
+def save_current_chat_to_db() -> None:
+    messages = st.session_state.get("messages", [])
+
+    if not messages:
+        return
+
+    init_history_db()
+
+    chat_id = st.session_state.get("current_chat_id") or str(uuid.uuid4())
+    st.session_state.current_chat_id = chat_id
+
+    title = make_chat_title(messages)
+    updated_at = now_iso()
+    messages_json = json.dumps(messages, ensure_ascii=False)
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        existing = conn.execute(
+            "SELECT created_at FROM chats WHERE id = ?",
+            (chat_id,),
+        ).fetchone()
+
+        created_at = existing[0] if existing else updated_at
+
+        conn.execute(
+            """
+            INSERT INTO chats (
+                id, title, messages_json, created_at, updated_at, mode, provider, model
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                messages_json = excluded.messages_json,
+                updated_at = excluded.updated_at,
+                mode = excluded.mode,
+                provider = excluded.provider,
+                model = excluded.model
+            """,
+            (
+                chat_id,
+                title,
+                messages_json,
+                created_at,
+                updated_at,
+                st.session_state.get("mode", "chat"),
+                st.session_state.get("provider", DEFAULT_PROVIDER),
+                st.session_state.get("model", ""),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_saved_chats(limit: int = 30) -> List[Dict[str, str]]:
+    init_history_db()
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, created_at, updated_at, mode, provider, model
+            FROM chats
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def load_chat_from_db(chat_id: str) -> Optional[Dict[str, Any]]:
+    init_history_db()
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM chats WHERE id = ?",
+            (chat_id,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        chat = dict(row)
+        chat["messages"] = json.loads(chat.get("messages_json", "[]"))
+        return chat
+    finally:
+        conn.close()
+
+
+def delete_chat_from_db(chat_id: str) -> None:
+    init_history_db()
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def render_css() -> None:
     st.markdown(
         """
@@ -128,10 +273,61 @@ def render_css() -> None:
         [data-testid="stSidebar"] {
             background: #eef3fa;
             border-right: 1px solid #d8e2f0;
+            width: 250px !important;
+            min-width: 250px !important;
+            max-width: 250px !important;
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            width: 250px !important;
+            min-width: 250px !important;
+            max-width: 250px !important;
         }
 
         [data-testid="stSidebar"] * {
             font-size: 0.92rem;
+        }
+
+        [data-testid="stSidebar"] button p,
+        [data-testid="stSidebar"] label p,
+        [data-testid="stSidebar"] .stMarkdown p {
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button {
+            background: #e8f1ff !important;
+            border: 1px solid #cfe0ff !important;
+            border-radius: 13px !important;
+            color: #0f172a !important;
+            box-shadow: none !important;
+            min-height: 2.35rem !important;
+            transition: transform 0.08s ease, background-color 0.08s ease, border-color 0.08s ease, box-shadow 0.08s ease !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            background: #dbeafe !important;
+            border-color: #bfdbfe !important;
+            color: #0f172a !important;
+            box-shadow: 0 3px 10px rgba(37, 99, 235, 0.08) !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:active {
+            transform: scale(0.97) !important;
+            background: #bfdbfe !important;
+            border-color: #93c5fd !important;
+            box-shadow: inset 0 0 0 1px #93c5fd !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:focus {
+            outline: none !important;
+            box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18) !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button p {
+            color: #0f172a !important;
+            font-weight: 500 !important;
         }
 
         h1 {
@@ -303,13 +499,54 @@ def render_css() -> None:
         }
 
         [data-testid="stChatInput"] button {
-            border-radius: 10px !important;
+            border-radius: 11px !important;
+            opacity: 1 !important;
+            border: 0 !important;
+            outline: 0 !important;
+            box-shadow: none !important;
+            transition: transform 0.08s ease, background-color 0.08s ease, box-shadow 0.08s ease !important;
         }
 
-        [data-testid="stChatInput"] button:first-child {
+        [data-testid="stChatInput"] button svg {
+            opacity: 1 !important;
+        }
+
+        [data-testid="stChatInput"] button:first-child,
+        [data-testid="stChatInput"] button:first-child:hover,
+        [data-testid="stChatInput"] button:first-child:focus {
             background: #dbeafe !important;
-            border-right: 1px solid #b9cce8 !important;
+            border: 0 !important;
+            border-right: 0 !important;
+            box-shadow: none !important;
             margin-right: 0.35rem !important;
+            color: #2563eb !important;
+        }
+
+        [data-testid="stChatInput"] button:last-child,
+        [data-testid="stChatInput"] button:last-child:hover,
+        [data-testid="stChatInput"] button:last-child:focus {
+            background: #dbeafe !important;
+            border: 0 !important;
+            box-shadow: none !important;
+            color: #1d4ed8 !important;
+            opacity: 1 !important;
+            filter: none !important;
+        }
+
+        [data-testid="stChatInput"] button:active {
+            transform: scale(0.92) !important;
+            background: #bfdbfe !important;
+            box-shadow: inset 0 0 0 1px #93c5fd !important;
+        }
+
+        [data-testid="stChatInput"] button:last-child svg,
+        [data-testid="stChatInput"] button:last-child:hover svg,
+        [data-testid="stChatInput"] button:last-child:focus svg,
+        [data-testid="stChatInput"] button:last-child:active svg {
+            color: #1d4ed8 !important;
+            stroke: #1d4ed8 !important;
+            opacity: 1 !important;
+            filter: none !important;
         }
 
         .login-wrap {
@@ -416,28 +653,15 @@ def init_state() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("chat_counter", 1)
     st.session_state.setdefault("history", [])
+    st.session_state.setdefault("current_chat_id", None)
     st.session_state.setdefault("authenticated", False)
 
 
 def reset_chat() -> None:
-    if st.session_state.messages:
-        title = next(
-            (m["content"] for m in st.session_state.messages if m["role"] == "user"),
-            "Pokalbis",
-        )
-        st.session_state.history.insert(
-            0,
-            {
-                "title": title[:60],
-                "messages": list(st.session_state.messages),
-                "created_at": dt.datetime.now().isoformat(timespec="minutes"),
-                "mode": st.session_state.mode,
-                "agent": st.session_state.agent_name,
-            },
-        )
+    save_current_chat_to_db()
     st.session_state.messages = []
+    st.session_state.current_chat_id = None
     st.session_state.chat_counter += 1
-
 
 def runtime_context() -> str:
     today = dt.datetime.now().strftime("%Y-%m-%d")
@@ -1187,26 +1411,59 @@ def render_sidebar() -> None:
     )
 
     st.sidebar.divider()
-    st.sidebar.subheader("Istorija šioje sesijoje")
+    st.sidebar.subheader("Pokalbių istorija")
 
-    if not st.session_state.history:
-        st.sidebar.caption("Istorija atsiras pradėjus naują pokalbį.")
+    saved_chats = list_saved_chats(limit=30)
 
-    for i, chat in enumerate(st.session_state.history[:15]):
+    if not saved_chats:
+        st.sidebar.caption("Istorija atsiras po pirmo pokalbio.")
+
+    for chat in saved_chats:
+        title = str(chat.get("title", "Pokalbis") or "Pokalbis").strip()
+        mode = chat.get("mode", "chat")
+
+        mode_icon = {
+            "chat": "💬",
+            "thinking": "🧠",
+            "deep": "🔎",
+        }.get(mode, "💬")
+
+        if len(title) > 30:
+            title = title[:27].rstrip() + "..."
+
+        label = f"{mode_icon} {title}"
+
         col1, col2 = st.sidebar.columns([0.82, 0.18])
 
         with col1:
-            if st.button(chat["title"], key=f"hist_{i}", use_container_width=True):
-                st.session_state.messages = list(chat["messages"])
-                st.session_state.mode = chat.get("mode", "chat")
-                if st.session_state.mode == "agent":
-                    st.session_state.mode = "chat"
-                st.session_state.agent_name = chat.get("agent", "Bendras asistentas")
-                st.rerun()
+            if st.button(label, key=f"hist_{chat['id']}", use_container_width=True):
+                save_current_chat_to_db()
+                loaded_chat = load_chat_from_db(chat["id"])
+
+                if loaded_chat:
+                    st.session_state.current_chat_id = loaded_chat["id"]
+                    st.session_state.messages = list(loaded_chat.get("messages", []))
+                    st.session_state.mode = loaded_chat.get("mode", "chat")
+
+                    if st.session_state.mode == "agent":
+                        st.session_state.mode = "chat"
+
+                    st.session_state.provider = loaded_chat.get("provider", st.session_state.provider)
+                    saved_model = loaded_chat.get("model", "")
+
+                    if saved_model:
+                        st.session_state.model = saved_model
+
+                    st.rerun()
 
         with col2:
-            if st.button("🗑", key=f"del_{i}"):
-                st.session_state.history.pop(i)
+            if st.button("🗑", key=f"del_{chat['id']}"):
+                delete_chat_from_db(chat["id"])
+
+                if st.session_state.get("current_chat_id") == chat["id"]:
+                    st.session_state.messages = []
+                    st.session_state.current_chat_id = None
+
                 st.rerun()
 
 
@@ -1278,6 +1535,8 @@ def main() -> None:
 
     if not check_password():
         return
+
+    init_history_db()
 
     if st.session_state.mode == "agent":
         st.session_state.mode = "chat"
@@ -1361,6 +1620,7 @@ def main() -> None:
         assistant_placeholder.markdown(final_answer)
 
         st.session_state.messages.append({"role": "assistant", "content": final_answer})
+        save_current_chat_to_db()
 
 
 if __name__ == "__main__":
