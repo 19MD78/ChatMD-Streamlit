@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import hmac
 import html
+import time
 from typing import Any, Dict, List, Tuple
 
 import streamlit as st
@@ -42,7 +43,7 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_24_1"
+APP_VERSION = "V. 2026_05_24_4"
 DEFAULT_PROVIDER = "Google Gemini"
 
 FALLBACK_MODELS: Dict[str, List[str]] = {
@@ -71,6 +72,10 @@ IMAGE_MIME_TYPES = {
     ".gif": "image/gif",
 }
 MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+
+DEEP_RESEARCH_AGENT_FAST = "deep-research-preview-04-2026"
+DEEP_RESEARCH_POLL_SECONDS = 10
+DEEP_RESEARCH_MAX_POLLS = 30
 
 DEFAULT_AGENTS = {
     "Bendras asistentas": {
@@ -379,19 +384,22 @@ def check_password() -> bool:
         unsafe_allow_html=True,
     )
 
-    entered_password = st.text_input(
-        "Slaptažodis",
-        type="password",
-        placeholder="Slaptažodis",
-        label_visibility="collapsed",
-    )
+    left, center, right = st.columns([1, 0.42, 1])
 
-    if st.button("Prisijungti", use_container_width=True):
-        if hmac.compare_digest(entered_password, app_password):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Neteisingas slaptažodis.")
+    with center:
+        entered_password = st.text_input(
+            "Slaptažodis",
+            type="password",
+            placeholder="Slaptažodis",
+            label_visibility="collapsed",
+        )
+
+        if st.button("Prisijungti", use_container_width=True):
+            if hmac.compare_digest(entered_password, app_password):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Neteisingas slaptažodis.")
 
     return False
 
@@ -704,6 +712,22 @@ def build_system_prompt() -> str:
 
         return base + "\n\n" + prompt
 
+    if st.session_state.mode == "thinking":
+        return (
+            base
+            + "\n\nTu esi ChatMD Mąstymo režime. Atsakyk giliau nei paprastame pokalbyje: "
+            "pirmiausia įvertink klausimo esmę, tada pateik struktūruotą, aiškų ir praktišką atsakymą. "
+            "Jei reikia, naudok interneto paiešką, kai ji įjungta. Neužtęsk be reikalo, bet parodyk svarbiausią logiką ir išvadas. "
+            "Atsakyk lietuviškai."
+        )
+
+    if st.session_state.mode == "deep":
+        return (
+            base
+            + "\n\nTu esi ChatMD Gilios analizės režime. Atlik išsamesnį tyrimą lietuviškai: "
+            "pateik aiškią struktūrą, svarbiausias išvadas, argumentus ir šaltinius, jei jie prieinami."
+        )
+
     return base + "\n\nTu esi naudingas, tikslus ir aiškiai lietuviškai atsakantis asistentas."
 
 
@@ -714,6 +738,141 @@ def make_files_context(uploaded_files) -> str:
     chunks = [read_uploaded_file(f) for f in uploaded_files]
     return "\n\n".join(chunks)
 
+
+
+def make_research_prompt(messages: List[Dict[str, str]], files_context: str, uploaded_files) -> str:
+    user_question = ""
+
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_question = str(m.get("content", ""))
+            break
+
+    research_prompt = [
+        build_system_prompt(),
+        "",
+        "Atlik gilią analizę lietuviškai. Pateik aiškią struktūrą, svarbiausias išvadas ir šaltinius, jei agentas juos turi.",
+        "",
+        "Vartotojo klausimas:",
+        user_question,
+    ]
+
+    if files_context:
+        research_prompt.extend(["", "Prisegtų failų tekstinis turinys:", files_context])
+
+    image_names = [f.name for f in uploaded_files or [] if is_image_file(f)]
+
+    if image_names:
+        research_prompt.extend(
+            [
+                "",
+                "Pastaba: ši pirmoji Gilios analizės versija vaizdų tiesiogiai Deep Research agentui dar neperduoda.",
+                "Prisegti vaizdai: " + ", ".join(image_names),
+            ]
+        )
+
+    return "\n".join(research_prompt).strip()
+
+
+def extract_interaction_text(interaction) -> str:
+    output_text = getattr(interaction, "output_text", "") or ""
+
+    if output_text:
+        return output_text
+
+    outputs = getattr(interaction, "outputs", None) or []
+
+    if outputs:
+        last_output = outputs[-1]
+        text = getattr(last_output, "text", "") or ""
+
+        if text:
+            return text
+
+    steps = getattr(interaction, "steps", None) or []
+
+    for step in reversed(steps):
+        text = getattr(step, "text", "") or ""
+
+        if text:
+            return text
+
+        output = getattr(step, "output", None)
+        text = getattr(output, "text", "") or ""
+
+        if text:
+            return text
+
+    return ""
+
+
+def stream_gemini_deep_research(files_context: str, uploaded_files=None):
+    api_key = get_api_key("Google Gemini")
+
+    if not api_key:
+        yield "🔴 Google Gemini API raktas neįvestas Streamlit Secrets."
+        return
+
+    if genai is None:
+        yield "🔴 Deep Research reikia google-genai bibliotekos."
+        return
+
+    if st.session_state.provider != "Google Gemini":
+        yield "🔴 Gili analizė šiuo metu veikia tik pasirinkus Google Gemini teikėją."
+        return
+
+    agent = DEEP_RESEARCH_AGENT_FAST
+    mode_label = "Gili analizė"
+
+    client = genai.Client(api_key=api_key)
+    research_input = make_research_prompt(st.session_state.messages, files_context, uploaded_files or [])
+
+    try:
+        interaction = client.interactions.create(
+            input=research_input,
+            agent=agent,
+            background=True,
+        )
+    except Exception as exc:
+        yield f"⚠️ Nepavyko paleisti {mode_label} užduoties: {exc}"
+        return
+
+    interaction_id = getattr(interaction, "id", "") or ""
+
+    yield (
+        f"🔎 **{mode_label} pradėta.**\n\n"
+        "Gemini Deep Research renka informaciją ir ruošia atsakymą. "
+        "Tai gali trukti ilgiau nei paprastas pokalbis.\n\n"
+    )
+
+    for _ in range(DEEP_RESEARCH_MAX_POLLS):
+        time.sleep(DEEP_RESEARCH_POLL_SECONDS)
+
+        try:
+            interaction = client.interactions.get(interaction_id)
+        except Exception as exc:
+            yield f"\n⚠️ Nepavyko patikrinti tyrimo būsenos: {exc}"
+            return
+
+        status = str(getattr(interaction, "status", "") or "").lower()
+
+        if status == "completed":
+            result = extract_interaction_text(interaction)
+            yield "\n✅ **Tyrimas baigtas.**\n\n"
+            yield result or "Gautas tuščias Deep Research atsakymas."
+            return
+
+        if status == "failed":
+            error = getattr(interaction, "error", "") or "Nežinoma klaida."
+            yield f"\n⚠️ Tyrimas nepavyko: {error}"
+            return
+
+        yield "⏳ "
+
+    yield (
+        "\n⚠️ Tyrimas dar nebaigtas per numatytą laiką. "
+        "Pabandyk trumpesnį klausimą arba naudok Mąstymas režimą, kuris yra greitesnis ir neveikia per Deep Research."
+    )
 
 def answer_google(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None) -> str:
     api_key = get_api_key("Google Gemini")
@@ -894,6 +1053,10 @@ def stream_answer(uploaded_files):
     model = st.session_state.model
 
     try:
+        if st.session_state.mode == "deep":
+            yield from stream_gemini_deep_research(files_context, uploaded_files)
+            return
+
         if provider == "Google Gemini":
             yield from stream_google(model, st.session_state.messages, files_context, uploaded_files)
             return
@@ -945,9 +1108,13 @@ def render_sidebar() -> None:
     st.sidebar.subheader("Režimas")
     mode = st.sidebar.radio(
         "Pasirink režimą",
-        ["chat", "agent"],
-        format_func=lambda x: "💬 Chat" if x == "chat" else "🤖 Agentas",
-        horizontal=True,
+        ["chat", "thinking", "deep"],
+        format_func=lambda x: {
+            "chat": "💬 Pokalbis",
+            "thinking": "🧠 Mąstymas",
+            "deep": "🔎 Gili analizė",
+        }.get(x, x),
+        horizontal=False,
         label_visibility="collapsed",
     )
 
@@ -956,47 +1123,11 @@ def render_sidebar() -> None:
         st.session_state.mode = mode
         st.rerun()
 
-    if st.session_state.mode == "agent":
-        names = list(st.session_state.agents.keys())
+    if st.session_state.mode == "thinking":
+        st.sidebar.info("Mąstymas atsako giliau, bet veikia greitai ir nenaudoja Deep Research.")
 
-        if st.session_state.agent_name not in names:
-            st.session_state.agent_name = names[0]
-
-        selected = st.sidebar.selectbox(
-            "Aktyvus agentas",
-            names,
-            index=names.index(st.session_state.agent_name),
-        )
-
-        if selected != st.session_state.agent_name:
-            reset_chat()
-            st.session_state.agent_name = selected
-            st.rerun()
-
-        with st.sidebar.expander("Kurti / redaguoti agentą"):
-            current = st.session_state.agents[st.session_state.agent_name]
-            name = st.text_input("Pavadinimas", st.session_state.agent_name)
-            icon = st.text_input("Ikona", current.get("icon", "🤖"))
-            system_prompt = st.text_area(
-                "System Prompt",
-                current.get("system_prompt", ""),
-                height=110,
-            )
-            examples = st.text_area(
-                "Pavyzdžiai / žinios",
-                current.get("examples", ""),
-                height=140,
-            )
-
-            if st.button("Išsaugoti agentą"):
-                st.session_state.agents[name] = {
-                    "icon": icon,
-                    "system_prompt": system_prompt,
-                    "examples": examples,
-                }
-                st.session_state.agent_name = name
-                reset_chat()
-                st.rerun()
+    if st.session_state.mode == "deep":
+        st.sidebar.info("Gili analizė naudoja Gemini Deep Research. Ji gali trukti kelias minutes. Pasirink Google Gemini teikėją.")
 
     st.sidebar.divider()
 
@@ -1068,6 +1199,8 @@ def render_sidebar() -> None:
             if st.button(chat["title"], key=f"hist_{i}", use_container_width=True):
                 st.session_state.messages = list(chat["messages"])
                 st.session_state.mode = chat.get("mode", "chat")
+                if st.session_state.mode == "agent":
+                    st.session_state.mode = "chat"
                 st.session_state.agent_name = chat.get("agent", "Bendras asistentas")
                 st.rerun()
 
@@ -1146,8 +1279,17 @@ def main() -> None:
     if not check_password():
         return
 
+    if st.session_state.mode == "agent":
+        st.session_state.mode = "chat"
+
     render_css()
     render_sidebar()
+
+    mode_label = {
+        "chat": "Pokalbis",
+        "thinking": "Mąstymas",
+        "deep": "Gili analizė",
+    }.get(st.session_state.mode, "Pokalbis")
 
     st.markdown("### ChatMD")
     st.markdown(
@@ -1156,7 +1298,7 @@ def main() -> None:
         <br>
         <span class="status-pill">{st.session_state.provider}</span>
         <span class="status-pill">{st.session_state.model}</span>
-        <span class="status-pill">{"Agentas: " + st.session_state.agent_name if st.session_state.mode == "agent" else "Paprastas chat"}</span>
+        <span class="status-pill">{mode_label}</span>
         <span class="status-pill">Internetas: {"ON" if st.session_state.web_search_enabled else "OFF"}</span>
         """,
         unsafe_allow_html=True,
