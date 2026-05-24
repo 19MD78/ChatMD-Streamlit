@@ -46,7 +46,7 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_24_8"
+APP_VERSION = "V. 2026_05_24_12"
 DEFAULT_PROVIDER = "Google Gemini"
 HISTORY_DB_PATH = "chatmd_history.db"
 
@@ -64,8 +64,6 @@ FALLBACK_MODELS: Dict[str, List[str]] = {
         "gpt-4.1-mini",
     ],
 }
-
-
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 IMAGE_MIME_TYPES = {
@@ -127,10 +125,52 @@ def init_history_db() -> None:
                 updated_at TEXT NOT NULL,
                 mode TEXT NOT NULL,
                 provider TEXT NOT NULL,
-                model TEXT NOT NULL
+                model TEXT NOT NULL,
+                agent_name TEXT NOT NULL DEFAULT ''
             )
             """
         )
+
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(chats)").fetchall()
+        }
+
+        if "agent_name" not in existing_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                name TEXT PRIMARY KEY,
+                icon TEXT NOT NULL,
+                system_prompt TEXT NOT NULL,
+                examples TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        existing_agents = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+
+        if existing_agents == 0:
+            created_at = now_iso()
+            for name, agent in DEFAULT_AGENTS.items():
+                conn.execute(
+                    """
+                    INSERT INTO agents (name, icon, system_prompt, examples, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        agent.get("icon", "🤖"),
+                        agent.get("system_prompt", ""),
+                        agent.get("examples", ""),
+                        created_at,
+                        created_at,
+                    ),
+                )
+
         conn.commit()
     finally:
         conn.close()
@@ -171,16 +211,17 @@ def save_current_chat_to_db() -> None:
         conn.execute(
             """
             INSERT INTO chats (
-                id, title, messages_json, created_at, updated_at, mode, provider, model
+                id, title, messages_json, created_at, updated_at, mode, provider, model, agent_name
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 messages_json = excluded.messages_json,
                 updated_at = excluded.updated_at,
                 mode = excluded.mode,
                 provider = excluded.provider,
-                model = excluded.model
+                model = excluded.model,
+                agent_name = excluded.agent_name
             """,
             (
                 chat_id,
@@ -191,6 +232,7 @@ def save_current_chat_to_db() -> None:
                 st.session_state.get("mode", "chat"),
                 st.session_state.get("provider", DEFAULT_PROVIDER),
                 st.session_state.get("model", ""),
+                st.session_state.get("agent_name", ""),
             ),
         )
         conn.commit()
@@ -206,7 +248,7 @@ def list_saved_chats(limit: int = 30) -> List[Dict[str, str]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, title, created_at, updated_at, mode, provider, model
+            SELECT id, title, created_at, updated_at, mode, provider, model, agent_name
             FROM chats
             ORDER BY updated_at DESC
             LIMIT ?
@@ -249,6 +291,158 @@ def delete_chat_from_db(chat_id: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def load_agents_from_db() -> Dict[str, Dict[str, str]]:
+    init_history_db()
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT name, icon, system_prompt, examples
+            FROM agents
+            ORDER BY created_at ASC, name ASC
+            """
+        ).fetchall()
+
+        agents = {
+            row["name"]: {
+                "icon": row["icon"],
+                "system_prompt": row["system_prompt"],
+                "examples": row["examples"],
+            }
+            for row in rows
+        }
+
+        return agents or {name: dict(agent) for name, agent in DEFAULT_AGENTS.items()}
+    finally:
+        conn.close()
+
+
+def save_agent_to_db(name: str, icon: str, system_prompt: str, examples: str, old_name: str = "") -> None:
+    init_history_db()
+
+    name = name.strip()
+    icon = icon.strip() or "🤖"
+    system_prompt = system_prompt.strip()
+    examples = examples.strip()
+    updated_at = now_iso()
+
+    if not name:
+        raise ValueError("Agento pavadinimas negali būti tuščias.")
+
+    if not system_prompt:
+        raise ValueError("Agento taisyklės negali būti tuščios.")
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        if old_name and old_name != name:
+            existing = conn.execute("SELECT 1 FROM agents WHERE name = ?", (name,)).fetchone()
+            if existing:
+                raise ValueError("Agentas tokiu pavadinimu jau yra.")
+
+            old_row = conn.execute("SELECT created_at FROM agents WHERE name = ?", (old_name,)).fetchone()
+            created_at = old_row[0] if old_row else updated_at
+            conn.execute("DELETE FROM agents WHERE name = ?", (old_name,))
+        else:
+            row = conn.execute("SELECT created_at FROM agents WHERE name = ?", (name,)).fetchone()
+            created_at = row[0] if row else updated_at
+
+        conn.execute(
+            """
+            INSERT INTO agents (name, icon, system_prompt, examples, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                icon = excluded.icon,
+                system_prompt = excluded.system_prompt,
+                examples = excluded.examples,
+                updated_at = excluded.updated_at
+            """,
+            (name, icon, system_prompt, examples, created_at, updated_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_agent_from_db(name: str) -> None:
+    init_history_db()
+
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    try:
+        conn.execute("DELETE FROM agents WHERE name = ?", (name,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_agents_export_json() -> str:
+    agents = load_agents_from_db()
+
+    payload = {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "exported_at": now_iso(),
+        "agents": [
+            {
+                "name": name,
+                "icon": agent.get("icon", "🤖"),
+                "system_prompt": agent.get("system_prompt", ""),
+                "examples": agent.get("examples", ""),
+            }
+            for name, agent in agents.items()
+        ],
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def import_agents_from_json_bytes(data: bytes) -> int:
+    try:
+        text = data.decode("utf-8")
+    except Exception:
+        text = data.decode("utf-8-sig", errors="ignore")
+
+    payload = json.loads(text)
+
+    if isinstance(payload, dict):
+        agents_data = payload.get("agents", [])
+    elif isinstance(payload, list):
+        agents_data = payload
+    else:
+        raise ValueError("JSON formatas netinkamas.")
+
+    if not isinstance(agents_data, list):
+        raise ValueError("JSON faile nerastas agentų sąrašas.")
+
+    imported_count = 0
+
+    for item in agents_data:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", "") or "").strip()
+        icon = str(item.get("icon", "🤖") or "🤖").strip()
+        system_prompt = str(item.get("system_prompt", "") or "").strip()
+        examples = str(item.get("examples", "") or "").strip()
+
+        if not name or not system_prompt:
+            continue
+
+        save_agent_to_db(
+            name=name,
+            icon=icon,
+            system_prompt=system_prompt,
+            examples=examples,
+        )
+        imported_count += 1
+
+    if imported_count == 0:
+        raise ValueError("Nepavyko importuoti nė vieno agento. Patikrink JSON struktūrą.")
+
+    return imported_count
 
 
 def render_css() -> None:
@@ -649,7 +843,7 @@ def init_state() -> None:
     st.session_state.setdefault("temperature", 0.7)
     st.session_state.setdefault("mode", "chat")
     st.session_state.setdefault("agent_name", "Bendras asistentas")
-    st.session_state.setdefault("agents", DEFAULT_AGENTS.copy())
+    st.session_state.setdefault("agents", load_agents_from_db())
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("chat_counter", 1)
     st.session_state.setdefault("history", [])
@@ -662,6 +856,7 @@ def reset_chat() -> None:
     st.session_state.messages = []
     st.session_state.current_chat_id = None
     st.session_state.chat_counter += 1
+
 
 def runtime_context() -> str:
     today = dt.datetime.now().strftime("%Y-%m-%d")
@@ -924,7 +1119,8 @@ def build_system_prompt() -> str:
     base = runtime_context()
 
     if st.session_state.mode == "agent":
-        agent = st.session_state.agents.get(
+        agents = st.session_state.get("agents") or load_agents_from_db()
+        agent = agents.get(
             st.session_state.agent_name,
             DEFAULT_AGENTS["Bendras asistentas"],
         )
@@ -934,7 +1130,7 @@ def build_system_prompt() -> str:
         if examples.strip():
             prompt += "\n\nAgento pavyzdžiai / žinios:\n" + examples.strip()
 
-        return base + "\n\n" + prompt
+        return base + "\n\nTu esi ChatMD agentų režime.\n\n" + prompt
 
     if st.session_state.mode == "thinking":
         return (
@@ -961,7 +1157,6 @@ def make_files_context(uploaded_files) -> str:
 
     chunks = [read_uploaded_file(f) for f in uploaded_files]
     return "\n\n".join(chunks)
-
 
 
 def make_research_prompt(messages: List[Dict[str, str]], files_context: str, uploaded_files) -> str:
@@ -1097,6 +1292,7 @@ def stream_gemini_deep_research(files_context: str, uploaded_files=None):
         "\n⚠️ Tyrimas dar nebaigtas per numatytą laiką. "
         "Pabandyk trumpesnį klausimą arba naudok Mąstymas režimą, kuris yra greitesnis ir neveikia per Deep Research."
     )
+
 
 def answer_google(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None) -> str:
     api_key = get_api_key("Google Gemini")
@@ -1320,6 +1516,173 @@ def render_brand() -> None:
     )
 
 
+def render_agents_panel() -> None:
+    st.session_state.agents = load_agents_from_db()
+    agents = st.session_state.agents
+
+    st.sidebar.subheader("Sukurti agentai")
+
+    if not agents:
+        st.sidebar.caption("Agentų dar nėra.")
+
+    agent_names = list(agents.keys())
+
+    if st.session_state.agent_name not in agent_names and agent_names:
+        st.session_state.agent_name = agent_names[0]
+
+    if agent_names:
+        selected_agent = st.sidebar.radio(
+            "Pasirink agentą",
+            agent_names,
+            index=agent_names.index(st.session_state.agent_name)
+            if st.session_state.agent_name in agent_names
+            else 0,
+            format_func=lambda name: f"{agents[name].get('icon', '🤖')} {name}",
+            label_visibility="collapsed",
+            key="agent_selector_radio",
+        )
+
+        if selected_agent != st.session_state.agent_name:
+            st.session_state.agent_name = selected_agent
+            reset_chat()
+            st.rerun()
+
+        active = agents.get(st.session_state.agent_name, {})
+        st.sidebar.caption(
+            f"Aktyvus agentas: {active.get('icon', '🤖')} {st.session_state.agent_name}"
+        )
+
+    with st.sidebar.expander("⚙️ Agentų valdymas", expanded=False):
+        st.caption("Čia gali kurti, redaguoti, trinti, importuoti ir eksportuoti agentus.")
+
+        with st.expander("➕ Sukurti naują agentą", expanded=False):
+            new_icon = st.text_input("Ikona", value="🤖", key="new_agent_icon")
+            new_name = st.text_input("Pavadinimas", value="", key="new_agent_name")
+            new_prompt = st.text_area(
+                "Taisyklės / sisteminė instrukcija",
+                value="",
+                height=160,
+                key="new_agent_prompt",
+                placeholder="Pvz.: Tu esi teisinis asistentas. Atsakyk aiškiai, struktūruotai, lietuviškai...",
+            )
+            new_examples = st.text_area(
+                "Pavyzdžiai / papildomos žinios",
+                value="",
+                height=120,
+                key="new_agent_examples",
+                placeholder="Čia gali įrašyti atsakymų pavyzdžius, toną, darbo tvarką arba specifines žinias.",
+            )
+
+            if st.button("Išsaugoti naują agentą", use_container_width=True):
+                try:
+                    save_agent_to_db(new_name, new_icon, new_prompt, new_examples)
+                    st.session_state.agent_name = new_name.strip()
+                    st.session_state.agents = load_agents_from_db()
+                    st.success("Agentas sukurtas.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Nepavyko sukurti agento: {exc}")
+
+        if agent_names and st.session_state.agent_name in agents:
+            current = agents[st.session_state.agent_name]
+
+            with st.expander("✏️ Redaguoti aktyvų agentą", expanded=False):
+                edit_icon = st.text_input(
+                    "Ikona",
+                    value=current.get("icon", "🤖"),
+                    key=f"edit_agent_icon_{st.session_state.agent_name}",
+                )
+                edit_name = st.text_input(
+                    "Pavadinimas",
+                    value=st.session_state.agent_name,
+                    key=f"edit_agent_name_{st.session_state.agent_name}",
+                )
+                edit_prompt = st.text_area(
+                    "Taisyklės / sisteminė instrukcija",
+                    value=current.get("system_prompt", ""),
+                    height=180,
+                    key=f"edit_agent_prompt_{st.session_state.agent_name}",
+                )
+                edit_examples = st.text_area(
+                    "Pavyzdžiai / papildomos žinios",
+                    value=current.get("examples", ""),
+                    height=140,
+                    key=f"edit_agent_examples_{st.session_state.agent_name}",
+                )
+
+                if st.button("Išsaugoti pakeitimus", use_container_width=True):
+                    old_name = st.session_state.agent_name
+                    try:
+                        save_agent_to_db(
+                            edit_name,
+                            edit_icon,
+                            edit_prompt,
+                            edit_examples,
+                            old_name=old_name,
+                        )
+                        st.session_state.agent_name = edit_name.strip()
+                        st.session_state.agents = load_agents_from_db()
+                        st.success("Agentas atnaujintas.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Nepavyko atnaujinti agento: {exc}")
+
+            with st.expander("🗑 Ištrinti aktyvų agentą", expanded=False):
+                st.warning("Ištrynus agentą, jo pokalbių istorija liks, bet pats agentas bus pašalintas.")
+                confirm_delete = st.checkbox(
+                    "Patvirtinu, kad noriu ištrinti šį agentą",
+                    key=f"confirm_delete_agent_{st.session_state.agent_name}",
+                )
+
+                if st.button("Ištrinti agentą", use_container_width=True):
+                    if not confirm_delete:
+                        st.error("Pirma pažymėk patvirtinimo varnelę.")
+                    else:
+                        try:
+                            delete_agent_from_db(st.session_state.agent_name)
+                            st.session_state.agents = load_agents_from_db()
+                            remaining = list(st.session_state.agents.keys())
+                            st.session_state.agent_name = remaining[0] if remaining else "Bendras asistentas"
+                            st.success("Agentas ištrintas.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Nepavyko ištrinti agento: {exc}")
+
+        with st.expander("💾 Importas / eksportas", expanded=False):
+            st.caption("Eksportas išsaugo tik agentus. API raktai ir slaptažodžiai neeksportuojami.")
+
+            export_json = make_agents_export_json()
+
+            st.download_button(
+                "Eksportuoti agentus į JSON",
+                data=export_json,
+                file_name="chatmd_agents.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            uploaded_agents_json = st.file_uploader(
+                "Importuoti agentus iš JSON",
+                type=["json"],
+                key="agents_import_json",
+            )
+
+            if uploaded_agents_json is not None:
+                if st.button("Importuoti agentus", use_container_width=True):
+                    try:
+                        imported_count = import_agents_from_json_bytes(uploaded_agents_json.getvalue())
+                        st.session_state.agents = load_agents_from_db()
+                        agent_names_after_import = list(st.session_state.agents.keys())
+
+                        if agent_names_after_import:
+                            st.session_state.agent_name = agent_names_after_import[0]
+
+                        st.success(f"Importuota agentų: {imported_count}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Nepavyko importuoti agentų: {exc}")
+
+
 def render_sidebar() -> None:
     render_brand()
 
@@ -1332,10 +1695,11 @@ def render_sidebar() -> None:
     st.sidebar.subheader("Režimas")
     mode = st.sidebar.radio(
         "Pasirink režimą",
-        ["chat", "thinking", "deep"],
+        ["chat", "thinking", "agent", "deep"],
         format_func=lambda x: {
             "chat": "💬 Pokalbis",
             "thinking": "🧠 Mąstymas",
+            "agent": "🤖 Agentai",
             "deep": "🔎 Gili analizė",
         }.get(x, x),
         horizontal=False,
@@ -1349,6 +1713,9 @@ def render_sidebar() -> None:
 
     if st.session_state.mode == "thinking":
         st.sidebar.info("Mąstymas atsako giliau, bet veikia greitai ir nenaudoja Deep Research.")
+
+    if st.session_state.mode == "agent":
+        render_agents_panel()
 
     if st.session_state.mode == "deep":
         st.sidebar.info("Gili analizė naudoja Gemini Deep Research. Ji gali trukti kelias minutes. Pasirink Google Gemini teikėją.")
@@ -1420,13 +1787,14 @@ def render_sidebar() -> None:
 
     for chat in saved_chats:
         title = str(chat.get("title", "Pokalbis") or "Pokalbis").strip()
-        mode = chat.get("mode", "chat")
+        chat_mode = chat.get("mode", "chat")
 
         mode_icon = {
             "chat": "💬",
             "thinking": "🧠",
+            "agent": "🤖",
             "deep": "🔎",
-        }.get(mode, "💬")
+        }.get(chat_mode, "💬")
 
         if len(title) > 30:
             title = title[:27].rstrip() + "..."
@@ -1444,11 +1812,12 @@ def render_sidebar() -> None:
                     st.session_state.current_chat_id = loaded_chat["id"]
                     st.session_state.messages = list(loaded_chat.get("messages", []))
                     st.session_state.mode = loaded_chat.get("mode", "chat")
-
-                    if st.session_state.mode == "agent":
-                        st.session_state.mode = "chat"
-
                     st.session_state.provider = loaded_chat.get("provider", st.session_state.provider)
+
+                    loaded_agent_name = loaded_chat.get("agent_name", "")
+                    if loaded_agent_name:
+                        st.session_state.agent_name = loaded_agent_name
+
                     saved_model = loaded_chat.get("model", "")
 
                     if saved_model:
@@ -1531,15 +1900,11 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
+    init_history_db()
     init_state()
 
     if not check_password():
         return
-
-    init_history_db()
-
-    if st.session_state.mode == "agent":
-        st.session_state.mode = "chat"
 
     render_css()
     render_sidebar()
@@ -1547,6 +1912,7 @@ def main() -> None:
     mode_label = {
         "chat": "Pokalbis",
         "thinking": "Mąstymas",
+        "agent": f"Agentai: {st.session_state.agent_name}",
         "deep": "Gili analizė",
     }.get(st.session_state.mode, "Pokalbis")
 
