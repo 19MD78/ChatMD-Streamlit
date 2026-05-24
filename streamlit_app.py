@@ -46,7 +46,7 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_24_12"
+APP_VERSION = "V. 2026_05_24_18"
 DEFAULT_PROVIDER = "Google Gemini"
 HISTORY_DB_PATH = "chatmd_history.db"
 
@@ -74,6 +74,8 @@ IMAGE_MIME_TYPES = {
     ".gif": "image/gif",
 }
 MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
+TEXT_FILE_CHAR_LIMIT = 1_000_000
+
 
 DEEP_RESEARCH_AGENT_FAST = "deep-research-preview-04-2026"
 DEEP_RESEARCH_POLL_SECONDS = 10
@@ -849,6 +851,7 @@ def init_state() -> None:
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("current_chat_id", None)
     st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("last_chat_settings_loaded", False)
 
 
 def reset_chat() -> None:
@@ -945,7 +948,7 @@ def make_image_note(uploaded_files) -> str:
 
 
 def make_google_contents(messages: List[Dict[str, str]], files_context: str, uploaded_files) -> List[Any]:
-    text_parts = [f"Sisteminė instrukcija:\n{build_system_prompt()}"]
+    text_parts = []
 
     for m in messages[-20:]:
         role = "Vartotojas" if m["role"] == "user" else "Asistentas"
@@ -1040,6 +1043,25 @@ def make_openai_input_messages(
     return input_messages
 
 
+def limit_text_for_model(name: str, text: str, limit: int = TEXT_FILE_CHAR_LIMIT) -> str:
+    if len(text) <= limit:
+        return f"[{name}]\n{text}"
+
+    half = max(1, limit // 2)
+    omitted_chars = len(text) - limit
+
+    return (
+        f"[{name}]\n"
+        f"[Pastaba: failas buvo per ilgas. Modeliui perduota pradžia ir pabaiga, "
+        f"praleista apie {omitted_chars:,} simbolių.]\n\n"
+        f"--- FAILO PRADŽIA ---\n"
+        f"{text[:half]}\n\n"
+        f"--- FAILO VIDURYS PRALEISTAS ---\n\n"
+        f"--- FAILO PABAIGA ---\n"
+        f"{text[-half:]}"
+    )
+
+
 def read_uploaded_file(uploaded_file) -> str:
     name = uploaded_file.name
     suffix = PathLike(name).suffix
@@ -1056,8 +1078,8 @@ def read_uploaded_file(uploaded_file) -> str:
             import io
 
             reader = PdfReader(io.BytesIO(data))
-            pages = [(p.extract_text() or "") for p in reader.pages[:20]]
-            return f"[{name}]\n" + "\n".join(pages)[:15000]
+            pages = [(p.extract_text() or "") for p in reader.pages]
+            return limit_text_for_model(name, "\n".join(pages))
 
         if suffix == ".docx":
             if docx is None:
@@ -1067,7 +1089,7 @@ def read_uploaded_file(uploaded_file) -> str:
 
             document = docx.Document(io.BytesIO(data))
             text = "\n".join(p.text for p in document.paragraphs if p.text.strip())
-            return f"[{name}]\n{text[:15000]}"
+            return limit_text_for_model(name, text)
 
         if suffix == ".xlsx":
             if openpyxl is None:
@@ -1078,16 +1100,16 @@ def read_uploaded_file(uploaded_file) -> str:
             wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
             rows = []
 
-            for ws in wb.worksheets[:3]:
+            for ws in wb.worksheets:
                 rows.append(f"Lapas: {ws.title}")
 
-                for row in ws.iter_rows(max_row=80, values_only=True):
+                for row in ws.iter_rows(values_only=True):
                     vals = [str(v) for v in row if v is not None]
 
                     if vals:
                         rows.append(" | ".join(vals))
 
-            return f"[{name}]\n" + "\n".join(rows)[:15000]
+            return limit_text_for_model(name, "\n".join(rows))
 
         if suffix == ".pptx":
             if Presentation is None:
@@ -1098,7 +1120,7 @@ def read_uploaded_file(uploaded_file) -> str:
             prs = Presentation(io.BytesIO(data))
             slides = []
 
-            for i, slide in enumerate(prs.slides[:30], 1):
+            for i, slide in enumerate(prs.slides, 1):
                 texts = []
 
                 for shape in slide.shapes:
@@ -1108,9 +1130,10 @@ def read_uploaded_file(uploaded_file) -> str:
                 if texts:
                     slides.append(f"Skaidrė {i}:\n" + "\n".join(texts))
 
-            return f"[{name}]\n" + "\n\n".join(slides)[:15000]
+            return limit_text_for_model(name, "\n\n".join(slides))
 
-        return f"[{name}]\n" + data.decode("utf-8", errors="ignore")[:15000]
+        text = data.decode("utf-8", errors="ignore")
+        return limit_text_for_model(name, text)
     except Exception as exc:
         return f"[{name}] Nepavyko nuskaityti: {exc}"
 
@@ -1294,6 +1317,30 @@ def stream_gemini_deep_research(files_context: str, uploaded_files=None):
     )
 
 
+def make_google_config():
+    system_instruction = build_system_prompt()
+
+    if genai_types is not None:
+        try:
+            tools = None
+
+            if st.session_state.web_search_enabled:
+                tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
+
+            return genai_types.GenerateContentConfig(
+                temperature=st.session_state.temperature,
+                system_instruction=system_instruction,
+                tools=tools,
+            )
+        except Exception:
+            pass
+
+    return {
+        "temperature": st.session_state.temperature,
+        "system_instruction": system_instruction,
+    }
+
+
 def answer_google(model: str, messages: List[Dict[str, str]], files_context: str, uploaded_files=None) -> str:
     api_key = get_api_key("Google Gemini")
 
@@ -1303,18 +1350,7 @@ def answer_google(model: str, messages: List[Dict[str, str]], files_context: str
     client = genai.Client(api_key=api_key)
     contents = make_google_contents(messages, files_context, uploaded_files or [])
 
-    config = {
-        "temperature": st.session_state.temperature,
-    }
-
-    if st.session_state.web_search_enabled and genai_types is not None:
-        try:
-            config = genai_types.GenerateContentConfig(
-                temperature=st.session_state.temperature,
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            )
-        except Exception:
-            pass
+    config = make_google_config()
 
     response = client.models.generate_content(
         model=model,
@@ -1335,18 +1371,7 @@ def stream_google(model: str, messages: List[Dict[str, str]], files_context: str
     client = genai.Client(api_key=api_key)
     contents = make_google_contents(messages, files_context, uploaded_files or [])
 
-    config = {
-        "temperature": st.session_state.temperature,
-    }
-
-    if st.session_state.web_search_enabled and genai_types is not None:
-        try:
-            config = genai_types.GenerateContentConfig(
-                temperature=st.session_state.temperature,
-                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
-            )
-        except Exception:
-            pass
+    config = make_google_config()
 
     try:
         stream = client.models.generate_content_stream(
@@ -1905,6 +1930,33 @@ def main() -> None:
 
     if not check_password():
         return
+
+    # Atstatome paskutinio pokalbio modelį ir teikėją tik vieną kartą po programos paleidimo.
+    # Taip šoniniame meniu ranka pakeistas modelis nebėra perrašomas kiekvieno Streamlit rerun metu.
+    if (
+        not st.session_state.last_chat_settings_loaded
+        and not st.session_state.messages
+        and not st.session_state.current_chat_id
+    ):
+        saved_chats = list_saved_chats(limit=1)
+        if saved_chats:
+            last_chat = load_chat_from_db(saved_chats[0]["id"])
+            if last_chat:
+                saved_model = last_chat.get("model", "")
+                saved_provider = last_chat.get("provider", "")
+                saved_mode = last_chat.get("mode", "chat")
+                saved_agent = last_chat.get("agent_name", "")
+
+                if saved_provider:
+                    st.session_state.provider = saved_provider
+                if saved_model:
+                    st.session_state.model = saved_model
+                if saved_mode:
+                    st.session_state.mode = saved_mode
+                if saved_agent:
+                    st.session_state.agent_name = saved_agent
+
+        st.session_state.last_chat_settings_loaded = True
 
     render_css()
     render_sidebar()
