@@ -2011,7 +2011,7 @@ def main() -> None:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-        pasted_files = []
+    pasted_files = []
 
     if paste is not None:
         with st.expander("📋 Įklijuoti screenshot iš clipboard", expanded=False):
