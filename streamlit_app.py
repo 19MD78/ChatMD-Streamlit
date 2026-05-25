@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import datetime as dt
 import hmac
 import html
@@ -44,9 +46,14 @@ try:
 except Exception:
     Presentation = None
 
+try:
+    from streamlit_paste_button import paste_image_button
+except Exception:
+    paste_image_button = None
+
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_24_18"
+APP_VERSION = "V. 2026_05_25_4"
 DEFAULT_PROVIDER = "Google Gemini"
 HISTORY_DB_PATH = "chatmd_history.db"
 
@@ -852,6 +859,7 @@ def init_state() -> None:
     st.session_state.setdefault("current_chat_id", None)
     st.session_state.setdefault("authenticated", False)
     st.session_state.setdefault("last_chat_settings_loaded", False)
+    st.session_state.setdefault("pasted_images", [])
 
 
 def reset_chat() -> None:
@@ -922,6 +930,53 @@ class PathLike:
         if "." not in self.name:
             return ""
         return "." + self.name.rsplit(".", 1)[1].lower()
+
+
+class PastedImageFile:
+    def __init__(self, data: bytes, name: str) -> None:
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def image_to_png_bytes(image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def add_pasted_image_to_state(image) -> bool:
+    data = image_to_png_bytes(image)
+    digest = hashlib.sha256(data).hexdigest()
+    pasted_images = list(st.session_state.get("pasted_images", []))
+
+    for item in pasted_images:
+        if item.get("digest") == digest:
+            return False
+
+    name = f"clipboard_screenshot_{len(pasted_images) + 1}.png"
+    pasted_images.append({"name": name, "data": data, "digest": digest})
+    st.session_state.pasted_images = pasted_images
+    return True
+
+
+def get_pasted_image_files() -> List[PastedImageFile]:
+    files = []
+
+    for item in st.session_state.get("pasted_images", []):
+        name = str(item.get("name", "clipboard_screenshot.png"))
+        data = item.get("data", b"")
+
+        if data:
+            files.append(PastedImageFile(data=data, name=name))
+
+    return files
+
+
+def clear_pasted_images() -> None:
+    st.session_state.pasted_images = []
 
 
 def is_image_file(uploaded_file) -> bool:
@@ -1708,6 +1763,62 @@ def render_agents_panel() -> None:
                         st.error(f"Nepavyko importuoti agentų: {exc}")
 
 
+def render_clipboard_paste_panel() -> None:
+    pasted_count = len(st.session_state.get("pasted_images", []))
+
+    if paste_image_button is None:
+        return
+
+    st.markdown(
+        """
+        <style>
+        .paste-toolbar-spacer {
+            height: clamp(260px, 54vh, 610px);
+        }
+
+        @media (max-height: 760px) {
+            .paste-toolbar-spacer {
+                height: clamp(150px, 42vh, 360px);
+            }
+        }
+        </style>
+        <div class="paste-toolbar-spacer"></div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    spacer, button_col, status_col, rest = st.columns([0.23, 0.19, 0.18, 0.40])
+
+    with button_col:
+        paste_result = paste_image_button(
+            label="📋 Įklijuoti screenshot",
+            text_color="#0f172a",
+            background_color="#e8f1ff",
+            hover_background_color="#dbeafe",
+            key="clipboard_paste_button",
+            errors="ignore",
+        )
+
+    pasted_image = getattr(paste_result, "image_data", None)
+
+    if pasted_image is not None:
+        added = add_pasted_image_to_state(pasted_image)
+        if added:
+            pasted_count = len(st.session_state.get("pasted_images", []))
+
+    with status_col:
+        if pasted_count:
+            st.markdown(
+                f'<span class="status-pill">🟢 {pasted_count} screenshot</span>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<span class="status-pill">⚪ Screenshot nėra</span>',
+                unsafe_allow_html=True,
+            )
+
+
 def render_sidebar() -> None:
     render_brand()
 
@@ -1988,6 +2099,8 @@ def main() -> None:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    render_clipboard_paste_panel()
+
     chat_value = st.chat_input(
         "Rašykite žinutę...",
         accept_file="multiple",
@@ -2012,6 +2125,8 @@ def main() -> None:
     prompt, uploaded_files = parse_chat_input(chat_value)
 
     if prompt or uploaded_files:
+        uploaded_files = list(uploaded_files or []) + get_pasted_image_files()
+
         if not prompt and uploaded_files:
             prompt = "Peržiūrėk prisegtus failus."
 
@@ -2039,6 +2154,7 @@ def main() -> None:
 
         st.session_state.messages.append({"role": "assistant", "content": final_answer})
         save_current_chat_to_db()
+        clear_pasted_images()
 
 
 if __name__ == "__main__":
