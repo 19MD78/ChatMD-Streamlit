@@ -2017,9 +2017,6 @@ def main() -> None:
         with st.expander("📋 Įklijuoti screenshot iš clipboard", expanded=False):
             pasted_image = paste(
                 label="Įklijuoti paveikslėlį iš clipboard",
-                text_color="#0f172a",
-                background_color="#e8f1ff",
-                hover_background_color="#dbeafe",
                 key="clipboard_paste_button",
             )
 
