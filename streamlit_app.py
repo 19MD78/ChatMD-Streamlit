@@ -53,7 +53,7 @@ except Exception:
 
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_25_4"
+APP_VERSION = "V. 2026_05_25_6"
 DEFAULT_PROVIDER = "Google Gemini"
 HISTORY_DB_PATH = "chatmd_history.db"
 
@@ -469,7 +469,7 @@ def render_css() -> None:
 
         .main .block-container {
             max-width: 980px;
-            padding-top: 1.2rem;
+            padding-top: 1.0rem;
             padding-bottom: 7rem;
         }
 
@@ -488,7 +488,22 @@ def render_css() -> None:
         }
 
         [data-testid="stSidebar"] * {
-            font-size: 0.92rem;
+            font-size: 0.90rem;
+        }
+
+        [data-testid="stSidebar"] hr {
+            margin: 0.65rem 0 !important;
+        }
+
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {
+            margin-top: 0.35rem !important;
+            margin-bottom: 0.35rem !important;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown {
+            margin-bottom: 0.15rem !important;
         }
 
         [data-testid="stSidebar"] button p,
@@ -505,7 +520,7 @@ def render_css() -> None:
             border-radius: 13px !important;
             color: #0f172a !important;
             box-shadow: none !important;
-            min-height: 2.35rem !important;
+            min-height: 2.15rem !important;
             transition: transform 0.08s ease, background-color 0.08s ease, border-color 0.08s ease, box-shadow 0.08s ease !important;
         }
 
@@ -545,37 +560,38 @@ def render_css() -> None:
         .chat-title {
             display: flex;
             align-items: center;
-            gap: 0.55rem;
-            padding: 0.15rem 0 0.35rem 0;
+            gap: 0.48rem;
+            padding: 0 0 0.12rem 0;
+            margin-top: -0.35rem;
         }
 
         .chat-logo {
-            width: 38px;
-            height: 38px;
+            width: 34px;
+            height: 34px;
             object-fit: contain;
         }
 
         .brand-main {
-            font-size: 1.22rem;
+            font-size: 1.14rem;
             font-weight: 700;
             line-height: 1;
         }
 
         .brand-sub {
-            font-size: 0.72rem;
+            font-size: 0.68rem;
             color: #526173;
-            margin-top: 0.1rem;
+            margin-top: 0.05rem;
         }
 
         .version-pill {
             display: inline-block;
-            padding: 0.16rem 0.45rem;
+            padding: 0.13rem 0.42rem;
             border-radius: 999px;
             background: #fff7ed;
             color: #9a3412;
             border: 1px solid #fed7aa;
-            font-size: 0.72rem;
-            margin-bottom: 0.6rem;
+            font-size: 0.70rem;
+            margin-bottom: 0.35rem;
         }
 
         .status-pill {
@@ -587,6 +603,17 @@ def render_css() -> None:
             font-size: 0.76rem;
             margin-right: 0.28rem;
             margin-bottom: 0.2rem;
+        }
+
+        [data-testid="stSidebar"] .stSelectbox,
+        [data-testid="stSidebar"] .stSlider,
+        [data-testid="stSidebar"] .stToggle,
+        [data-testid="stSidebar"] .stRadio {
+            margin-bottom: 0.25rem !important;
+        }
+
+        [data-testid="stSidebar"] label {
+            margin-bottom: 0.15rem !important;
         }
 
         .chat-area {
@@ -1773,12 +1800,12 @@ def render_clipboard_paste_panel() -> None:
         """
         <style>
         .paste-toolbar-spacer {
-            height: clamp(260px, 54vh, 610px);
+            height: clamp(310px, 61vh, 700px);
         }
 
         @media (max-height: 760px) {
             .paste-toolbar-spacer {
-                height: clamp(150px, 42vh, 360px);
+                height: clamp(190px, 46vh, 430px);
             }
         }
         </style>
@@ -1787,7 +1814,7 @@ def render_clipboard_paste_panel() -> None:
         unsafe_allow_html=True,
     )
 
-    spacer, button_col, status_col, rest = st.columns([0.23, 0.19, 0.18, 0.40])
+    spacer, button_col, status_col, rest = st.columns([0.24, 0.16, 0.14, 0.46])
 
     with button_col:
         paste_result = paste_image_button(
