@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import io
 import datetime as dt
 import hmac
 import html
@@ -45,14 +44,9 @@ try:
 except Exception:
     Presentation = None
 
-try:
-    from st_img_pastebutton import paste
-except Exception:
-    paste = None
-
 
 APP_NAME = "ChatMD"
-APP_VERSION = "V. 2026_05_25_1"
+APP_VERSION = "V. 2026_05_24_18"
 DEFAULT_PROVIDER = "Google Gemini"
 HISTORY_DB_PATH = "chatmd_history.db"
 
@@ -928,16 +922,6 @@ class PathLike:
         if "." not in self.name:
             return ""
         return "." + self.name.rsplit(".", 1)[1].lower()
-
-class PastedImageFile:
-    def __init__(self, image, name: str = "clipboard_screenshot.png") -> None:
-        self.name = name
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        self._data = buffer.getvalue()
-
-    def getvalue(self) -> bytes:
-        return self._data
 
 
 def is_image_file(uploaded_file) -> bool:
@@ -1842,47 +1826,40 @@ def render_sidebar() -> None:
 
         label = f"{mode_icon} {title}"
 
-        if st.button(label, key=f"hist_{chat['id']}", use_container_width=True):
-            save_current_chat_to_db()
-            loaded_chat = load_chat_from_db(chat["id"])
+        col1, col2 = st.sidebar.columns([0.82, 0.18])
 
-            if loaded_chat:
-                st.session_state.current_chat_id = loaded_chat["id"]
-                st.session_state.messages = list(loaded_chat.get("messages", []))
-                st.session_state.mode = loaded_chat.get("mode", "chat")
-                st.session_state.provider = loaded_chat.get("provider", st.session_state.provider)
+        with col1:
+            if st.button(label, key=f"hist_{chat['id']}", use_container_width=True):
+                save_current_chat_to_db()
+                loaded_chat = load_chat_from_db(chat["id"])
 
-                loaded_agent_name = loaded_chat.get("agent_name", "")
-                if loaded_agent_name:
-                    st.session_state.agent_name = loaded_agent_name
+                if loaded_chat:
+                    st.session_state.current_chat_id = loaded_chat["id"]
+                    st.session_state.messages = list(loaded_chat.get("messages", []))
+                    st.session_state.mode = loaded_chat.get("mode", "chat")
+                    st.session_state.provider = loaded_chat.get("provider", st.session_state.provider)
 
-                saved_model = loaded_chat.get("model", "")
+                    loaded_agent_name = loaded_chat.get("agent_name", "")
+                    if loaded_agent_name:
+                        st.session_state.agent_name = loaded_agent_name
 
-                if saved_model:
-                    st.session_state.model = saved_model
+                    saved_model = loaded_chat.get("model", "")
+
+                    if saved_model:
+                        st.session_state.model = saved_model
+
+                    st.rerun()
+
+        with col2:
+            if st.button("🗑", key=f"del_{chat['id']}"):
+                delete_chat_from_db(chat["id"])
+
+                if st.session_state.get("current_chat_id") == chat["id"]:
+                    st.session_state.messages = []
+                    st.session_state.current_chat_id = None
 
                 st.rerun()
-                
-        if st.session_state.get("current_chat_id"):
-            st.sidebar.divider()
-    
-            with st.sidebar.expander("⚙️ Istorijos valdymas", expanded=False):
-                st.caption("Čia gali ištrinti šiuo metu atidarytą pokalbį.")
-    
-                confirm_delete_current_chat = st.checkbox(
-                    "Patvirtinu, kad noriu ištrinti atidarytą pokalbį",
-                    key="confirm_delete_current_chat",
-                )
-    
-                if st.button("🗑 Ištrinti atidarytą pokalbį", use_container_width=True):
-                    if not confirm_delete_current_chat:
-                        st.error("Pirma pažymėk patvirtinimo varnelę.")
-                    else:
-                        delete_chat_from_db(st.session_state.current_chat_id)
-                        st.session_state.messages = []
-                        st.session_state.current_chat_id = None
-                        st.success("Pokalbis ištrintas.")
-                        st.rerun()
+
 
 def parse_chat_input(chat_value):
     if not chat_value:
@@ -2011,21 +1988,6 @@ def main() -> None:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    pasted_files = []
-
-    if paste is not None:
-        with st.expander("📋 Įklijuoti screenshot iš clipboard", expanded=False):
-            pasted_image = paste(
-                label="Įklijuoti paveikslėlį iš clipboard",
-                key="clipboard_paste_button",
-            )
-
-            if pasted_image is not None:
-                pasted_files.append(PastedImageFile(pasted_image))
-                st.success("Screenshot įklijuotas. Dabar parašyk žinutę ir išsiųsk.")
-    else:
-        st.caption("📋 Screenshot įklijavimo funkcijai reikia paketo st-img-pastebutton.")
-        
     chat_value = st.chat_input(
         "Rašykite žinutę...",
         accept_file="multiple",
@@ -2048,7 +2010,6 @@ def main() -> None:
     )
 
     prompt, uploaded_files = parse_chat_input(chat_value)
-    uploaded_files = list(uploaded_files or []) + pasted_files
 
     if prompt or uploaded_files:
         if not prompt and uploaded_files:
